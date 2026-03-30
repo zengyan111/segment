@@ -1,0 +1,341 @@
+import os
+import numpy as np
+import torch
+import argparse
+from PIL import Image
+from segmentation_data_process import LiverDataset
+from torch.utils.data import DataLoader, random_split
+from torch import nn, optim
+from torchvision.transforms import transforms
+from segmentation_att_unet import UnetCbam, UnetCabm_drop, ResUnet
+from tqdm import tqdm
+import segmentation_models_pytorch as smp
+import matplotlib.pyplot as plt
+
+from torchvision.utils import save_image
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+
+
+def get_transfors(height, width):
+    # test to pil image
+    x_transforms = transforms.Compose([
+        # transforms.ToPILImage(),
+        transforms.Resize((height,width)),
+        transforms.ToTensor(),
+    ])
+    y_transforms = transforms.Compose([
+        # transforms.ToPILImage(),
+        transforms.Resize((height,width)),
+        transforms.ToTensor(),
+    ])
+    return x_transforms, y_transforms
+
+def train_model(config, model, train_loader, eval_loader, criterion, optimizer, scheduler):
+    # save logs
+    # save ckpt
+    if not os.path.exists('logs'):
+        os.makedirs('logs')
+    if not os.path.exists('checkpoint'):
+        os.makedirs('checkpoint')
+    epochs_nu = 'logs/log.txt'
+    confu_path = 'logs/confusion_matrix.png'
+    re_path  = 'logs/loss_curve.png'
+    
+    # runtime record analysis data
+    train_losses = []
+    test_losses = []
+    train_accuracies = []
+    test_accuracies = []
+    epoch_n = []
+
+    # save best model
+    best_acc = 0
+    for epoch in range(config['epochs']):
+        with open(epochs_nu, 'a', encoding='utf-8')as epoch_num:
+            epoch_num.write(f"{epoch + 1}/n")
+
+        model.train()
+        with open(epochs_nu,'a', encoding='utf-8') as open_epochs:
+            open_epochs.write(f"{epoch+1}\n")
+        # reserve analyze data 
+        data_size = len(train_loader.dataset)
+        epoch_loss = 0
+        step = 0
+        total = 0
+        correct = 0
+        predect_list = []
+        label_list = []
+        # start critation
+        for images, labels in train_loader:
+            step += 1
+            # print(images.shape)
+            images = images.to(device)
+            labels = labels.to(device).long()
+            # zreo gradients
+            optimizer.zero_grad()
+
+            # forward
+            output = model(images)
+            output = output.permute(0, 2, 3, 1).reshape(-1,output.shape[1])
+            # get classifier number, may cancle
+            # labels = labels.shape(-1)
+            # predect truth and labels differen, get backward
+            loss = criterion(output, labels)
+            # get gradient
+            loss.backward()
+            # storage weights and bias 
+            optimizer.step()
+            scheduler.step()
+            # .item() tran number to calulate loss, garather complete epochs loss
+            epoch_loss += loss.item()
+            batch_total, batch_accurcy = get_batch_acc(output,labels)
+            # mermory all caculate data 
+            total += batch_total
+            correct += batch_accurcy 
+            all_accuracy = correct / total * 100
+            acc_info = "%d/%d, train loss: %0.3f, accuracy rate: %0.2f" % (step, 
+                                                                       (data_size - 1) // train_loader.batch_size + 1, 
+                                                                       epoch_loss/step, 
+                                                                       all_accuracy)
+            # print(acc_info)
+
+            # save ture and predict torch infor
+            predicted_classes = torch.argmax(output, dim=1)
+            predect_list.extend(predicted_classes.detach().cpu().numpy().tolist())
+            labels_flat = labels.view(-1)
+            label_list.extend(labels_flat.detach().cpu().numpy().tolist())
+
+        # eval images
+        test_loss, test_accuracy = eval(model, criterion, eval_loader)
+        # epoch_info = "epoch: %d train loss: %.4f, train acc: %.2f %%, eval loss: %.4f, eval acc: %.2f %%" % (
+        #     epoch,
+        #     epoch_loss / step,
+        #     all_accuracy,
+        #     test_loss,
+        #     test_accuracy
+        # )
+        train_losses.append(epoch_loss / step)
+        test_losses.append(test_loss)
+        train_accuracies.append(all_accuracy)
+        test_accuracies.append(test_accuracy)
+        epoch_n.append(epoch)
+        draw_loss(epoch_n, train_losses, test_losses, train_accuracies, test_accuracies, re_path)
+        
+        # save model
+        if test_accuracy > best_acc:
+            best_acc = test_accuracy
+            torch.save(model.state_dict(),'checkpoint/unetCbam_best.pth')
+        torch.save(model.state_dict(), 'checkpoint/unetCbam.pth')
+
+        # save model train information :1. confusion context; 2. loss curve, accuracy, recall, 3.value: IOU, 
+        if  epoch % 2 == 0:
+            confusion_matrix_plot(config, label_list, predect_list, confu_path, epoch)
+
+
+def draw_loss(epoch, train, test, train_acc, test_acc, re_path):
+    fig, ax1 = plt.subplots(figsize = (8, 6))
+    ax1.plot(epoch, train,  label = ('train loss'), color = 'blue', linestyle = '--')
+    ax1.plot(epoch,test,  label = ('test loss'), color = 'red', linestyle = '-')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss', color = 'blue')
+    ax1.set_ylim(0, 1)
+    ax1.tick_params(axis='y', labelcolor = 'blue')
+    ax1.legend(loc='upper right')
+
+    ax2 = ax1.twinx()
+    ax2.plot(epoch, train_acc, label = ('Train Accuracy'), color = 'green', linestyle = '--')
+    ax2.plot(epoch, test_acc, label = ('Test Accuracy'), color = 'orange', linestyle = '-')
+
+    ax2.set_ylabel('Accuracy(%)', color = 'orange')
+    ax2.set_ylim(0, 100)
+    ax2.tick_params(axis='y', labelcolor = 'orange')
+
+    fig.tight_layout()
+    ax2.legend(loc= 'upper left')
+
+    plt.title('Train Loss and Accuracy')
+    plt.savefig(re_path)
+    plt.close()
+    
+
+def confusion_matrix_plot(config, train, prediction, path, epoch):
+    class_n = config['out_ch']
+    cm = confusion_matrix(train, prediction)
+
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=range(class_n), yticklabels=range(class_n))
+    plt.title(f'confusion matrix epoch: {epoch}')
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.savefig(path)
+    plt.close()
+
+
+def eval(model, criterion, eval_loader):
+    detaloaders = eval_loader
+    model.eval()
+    print("Eval...")
+
+    epoch_loss = 0
+    step = 0
+    total = 0
+    correct = 0
+    with torch.no_grad():
+        for input, labels in detaloaders:
+            step += 1
+            input = input.to(device)
+            labels = labels.to(device)
+            outputs = model(input)
+            outputs = outputs.permute(0, 2, 3, 1).reshape(-1,outputs.shape[1])
+
+            loss = criterion(outputs, labels)
+            epoch_loss += loss.item()
+
+            batch_total, batch_acc = get_batch_acc(outputs,labels)
+            total += batch_total
+            correct += batch_acc
+    test_loss = epoch_loss / step
+    test_accuracy = correct / total * 100
+    return test_loss, test_accuracy
+
+
+def get_batch_acc(outputs, labels):
+    total = labels.numel()
+    labels = labels.view(-1)  
+    outputs = torch.argmax(outputs,dim=1)
+    correct = torch.eq(outputs, labels).sum().detach().cpu().item()
+    # total complete peixl, correct predect accuarcy peixl
+    return total, correct
+
+
+def train(config):
+    # prepare data 
+    x_transforms, y_transforms = get_transfors(config['height'], config['width'])
+    dataset = LiverDataset(config['train_path'], transform=x_transforms, target_transform=None, image_size=(config['height'], config['width']))
+
+    # determined eval number 
+    eval_number = int(config['eval_rate']* len(dataset) *0.01)
+    train_number  = int(len(dataset)-eval_number)
+    # random split eval image 
+    train_data, eval_data = random_split(dataset,[train_number, eval_number])
+    train_loader = DataLoader(train_data, batch_size=config['batch_size'],shuffle=True, num_workers=4)
+    eval_loader = DataLoader(eval_data, batch_size=config['batch_size'], shuffle=True, num_workers=4)
+
+    # define model 
+    if config['model'] == 'ResUnet':
+        model = ResUnet(config['in_ch'],config['out_ch'],config['drop_rate']).to(device)
+    elif config['model'] == 'UnetCbam':
+        model = UnetCbam(config['in_ch'],config['out_ch'],config['drop_rate']).to(device)
+    else:
+        model = UnetCabm_drop(config['in_ch'],config['out_ch'],config['drop_rate']).to(device)
+
+    # loss function
+    if config['out_ch'] > 1:
+        criterion = smp.losses.LovaszLoss(mode='multiclass')
+    else:
+        criterion = nn.CrossEntropyLoss()
+
+    # optimizer
+    optimizer = optim.Adam(model.parameters(), lr=config['l_rate'])
+    scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=99,gamma = 0.1)
+    
+    # design rodom seed: control result consistency
+    generator = torch.Generator(device=device) 
+    generator.manual_seed(666)
+
+    # train loop
+    train_model(config, model, train_loader, eval_loader, criterion, optimizer, scheduler)
+
+
+def test(config):
+    if config['model'] == 'ResUnet':
+        model = ResUnet(config['in_ch'],config['out_ch']).to(device)
+    elif config['model'] == 'UnetCbam':
+        model = UnetCbam(config['in_ch'],config['out_ch']).to(device)
+    else:
+        model = UnetCabm_drop(config['in_ch'],config['out_ch']).to(device)
+
+    model.load_state_dict(torch.load(config['ckpt_path'],map_location='cuda'))
+    x_transforms, y_transforms = get_transfors(config['height'], config['width'])
+    test_data = LiverDataset(config['test_path'], transform=x_transforms, target_transform=None, 
+                             image_size=(config['height'], config['width']))
+    test_loader = DataLoader(test_data, batch_size=1, shuffle=False)
+
+    model.eval()
+    if not os.path.exists(config['test_result']):
+        os.makedirs(config['test_result'])
+
+    list_na = []
+    for name in os.listdir(config['test_path']):
+        name = name.split(".")[0]
+        list_na.append(name)
+
+    with torch.no_grad():
+        for idx,(pre,m) in enumerate(tqdm(test_loader,total=len(test_loader))):
+            pre = pre.to(device)
+            out = model(pre)
+            if config['out_ch'] == 1:
+                pre_mask = torch.sigmoid(out)
+                pre_mask = (pre_mask > 0.5).float()
+
+                # save mask 
+                for save_i in range(pre_mask.size(0)):
+                    save_pre = os.path.join(config['test_result'],f"{list_na[idx]}.bmp")
+                    save_image(pre_mask[save_i], save_pre)
+            else:
+                pre_mask = torch.softmax(out,dim=1)
+                # pre_mask = torch.argmax(pre_mask, dim=1, keepdim=True).float()
+                B, C, H, W = pre_mask.shape
+
+                min_val = 0
+                max_val = 1
+                min_pex = 0
+                max_pex = 255
+                for b in range(B):
+                    for c in range(C):
+                        c_mask = pre_mask[b, c]
+
+                        # mapped
+                        clipped = torch.clamp(c_mask, min=min_val, max=max_val)
+                        gray = ((clipped-min_val)/(max_val-min_val))*(max_pex-min_pex) + min_pex
+                        gray = gray.to(torch.uint8)
+                        c_mask = gray.float()/255
+
+                        save_ch = os.path.join(config['test_result'],f'{list_na[idx]}_{c}.bmp')
+                        save_image(c_mask, save_ch)
+ 
+
+def get_config():
+    config = {
+        'action': 'train',
+        'model':'ResUnet',
+        'in_ch':1,
+        'out_ch':3,
+        'width':512,
+        'height':256,
+        'epochs':100,
+        'eval_rate':10,
+        'batch_size':4,
+        'drop_rate':0.3,
+        'l_rate':0.0001,
+        'train_path':r'D:\AI_code\python\dataset\train_images\roi',
+        'test_path':r'D:\AI_code\python\dataset\test_images',
+        'test_result':r'D:\AI_code\python\result',
+        'ckpt_path':r'D:\AI_code\python\checkpoint\unetCbam.pth',
+        'resume_ckpt':'',
+        'vit_name':'R50-ViT-L_16',
+    }
+    return config
+
+def run_modul(config):
+    if config['action'] == 'train':
+        train(config)
+    elif config['action'] == 'test':
+        test(config)
+
+if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    config = get_config()
+    run_modul(config)
